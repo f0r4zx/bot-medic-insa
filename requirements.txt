@@ -2,3 +2,4 @@ fastapi
 uvicorn
 python-telegram-bot
 paho-mqtt
+python-dotenv
