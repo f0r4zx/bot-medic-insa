@@ -1,19 +1,31 @@
 from fastapi import FastAPI, Request
-import uvicorn
+from telegram import Bot
+import os
 
 app = FastAPI()
 
+TOKEN = os.getenv("BOT_TOKEN")
+
+bot = Bot(token=TOKEN)
+
 @app.get("/")
 async def home():
-    return {"status": "Bot funcionando"}
+    return {"status": "activo"}
 
 @app.post("/webhook")
 async def webhook(req: Request):
+
     data = await req.json()
 
     print(data)
 
-    return {"ok": True}
+    if "message" in data:
+        chat_id = data["message"]["chat"]["id"]
+        text = data["message"].get("text", "")
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"Recibí: {text}"
+        )
+
+    return {"ok": True}
