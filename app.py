@@ -3,47 +3,47 @@ from telegram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from contextlib import asynccontextmanager
+from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime, date, timedelta
 import os
 import re
-import json
-import threading
 
 # ══════════════════════════════════════════════════════════
 #  CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════
 TOKEN = os.getenv("BOT_TOKEN")
-bot   = Bot(token=TOKEN)
+MONGO_URL = os.getenv("MONGO_URL")
 
-# 🔹 PERSISTENCIA: Archivo donde se guardará la información
-ARCHIVO_DATOS = "bot_memoria.json"
-datos_lock = threading.Lock()
+bot = Bot(token=TOKEN)
 
-# 🔹 PERSISTENCIA: Funciones para cargar y guardar
-def cargar_datos():
-    if os.path.exists(ARCHIVO_DATOS):
-        with open(ARCHIVO_DATOS, "r", encoding="utf-8") as f:
-            return json.load(f)
+# 🔹 CONEXIÓN A MONGODB ATLAS
+cliente_mongo = AsyncIOMotorClient(MONGO_URL)
+db = cliente_mongo.bot_medic
+coleccion_datos = db.memoria
+
+# ══════════════════════════════════════════════════════════
+#  BASE DE DATOS EN MEMORIA (Se sincroniza con Mongo)
+# ══════════════════════════════════════════════════════════
+usuarios: dict = {}
+senales_pendientes: list = []
+conversacion: dict = {} # Transitorio
+
+# 🔹 PERSISTENCIA: Funciones asíncronas para MongoDB
+async def cargar_datos():
+    doc = await coleccion_datos.find_one({"_id": "memoria_global"})
+    if doc:
+        return doc.get("usuarios", {})
     return {}
 
-def guardar_datos(data: dict):
-    with datos_lock:
-        with open(ARCHIVO_DATOS, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+async def guardar_datos(data: dict):
+    await coleccion_datos.update_one(
+        {"_id": "memoria_global"},
+        {"$set": {"usuarios": data}},
+        upsert=True
+    )
 
 # ══════════════════════════════════════════════════════════
-#  BASE DE DATOS (Ahora persistente)
-# ══════════════════════════════════════════════════════════
-usuarios: dict = cargar_datos()
-senales_pendientes: list = []
-
-# ══════════════════════════════════════════════════════════
-#  ESTADO CONVERSACIONAL (Se mantiene en RAM, es transitorio)
-# ══════════════════════════════════════════════════════════
-conversacion: dict = {}
-
-# ══════════════════════════════════════════════════════════
-#  MESES EN ESPAÑOL
+#  MESES Y AYUDA
 # ══════════════════════════════════════════════════════════
 MESES = {
     "enero": 1,   "ene": 1,   "jan": 1, "febrero": 2, "feb": 2,
@@ -60,9 +60,6 @@ NOMBRE_MES = {
     9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
 }
 
-# ══════════════════════════════════════════════════════════
-#  MENSAJES DE AYUDA (Igual que antes)
-# ══════════════════════════════════════════════════════════
 AYUDA = {
     "/addmed": "➕ *Agregar medicamento*\n\n`/addmed <nombre>`\n\nEj: `/addmed Paracetamol`",
     "/deletemed": "🗑️ *Eliminar medicamento*\n\n`/deletemed <nombre>`",
@@ -95,7 +92,9 @@ def registrar_todos_los_horarios():
                 )
 
 async def disparar_medicamento(chat_id: int, med_nombre: str, horario: str):
-    med = usuarios.get(chat_id, {}).get("meds", {}).get(med_nombre)
+    # Asegurar que chat_id sea entero o string según cómo se guardó
+    chat_id_str = str(chat_id)
+    med = usuarios.get(chat_id_str, {}).get("meds", {}).get(med_nombre)
     if not med:
         return
     hoy = date.today()
@@ -106,7 +105,7 @@ async def disparar_medicamento(chat_id: int, med_nombre: str, horario: str):
     if ff and hoy > date.fromisoformat(ff):
         return
 
-    nombre_p = usuarios[chat_id].get("profile", {}).get("nombre", "")
+    nombre_p = usuarios[chat_id_str].get("profile", {}).get("nombre", "")
     saludo   = f"*{nombre_p}*, " if nombre_p else ""
 
     await bot.send_message(
@@ -131,12 +130,18 @@ async def disparar_medicamento(chat_id: int, med_nombre: str, horario: str):
 # ══════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global usuarios
+    usuarios_db = await cargar_datos()
+    usuarios.update(usuarios_db)
+    
     scheduler.start()
     registrar_todos_los_horarios()
-    print("[BOT MEDIC] Scheduler iniciado. Datos cargados desde memoria persistente.")
+    print("[BOT MEDIC] Scheduler iniciado. Datos cargados desde MongoDB Atlas.")
+    
     yield
+    
     scheduler.shutdown()
-    guardar_datos(usuarios)  # 🔹 Guardar al apagar el servidor
+    await guardar_datos(usuarios) 
 
 app = FastAPI(lifespan=lifespan)
 
@@ -145,7 +150,7 @@ app = FastAPI(lifespan=lifespan)
 # ══════════════════════════════════════════════════════════
 @app.get("/")
 async def home():
-    return {"status": "Bot Medic funcionando ✅"}
+    return {"status": "Bot Medic funcionando ✅ Conectado a MongoDB"}
 
 @app.get("/esp32/signal")
 async def esp32_signal():
@@ -156,15 +161,17 @@ async def esp32_signal():
 # ══════════════════════════════════════════════════════════
 #  HELPERS GENERALES
 # ══════════════════════════════════════════════════════════
-def init_user(chat_id):
-    if chat_id not in usuarios:
-        usuarios[chat_id] = {"profile": {}, "meds": {}}
-        guardar_datos(usuarios)  # 🔹 Guardar nuevo usuario
-    if chat_id not in conversacion:
-        conversacion[chat_id] = {"flujo": None, "paso": 0, "datos": {}}
+async def init_user(chat_id):
+    chat_id_str = str(chat_id) # JSON/Mongo guarda las llaves numéricas como strings
+    if chat_id_str not in usuarios:
+        usuarios[chat_id_str] = {"profile": {}, "meds": {}}
+        await guardar_datos(usuarios) 
+    if chat_id_str not in conversacion:
+        conversacion[chat_id_str] = {"flujo": None, "paso": 0, "datos": {}}
+    return chat_id_str
 
-def limpiar_conversacion(chat_id):
-    conversacion[chat_id] = {"flujo": None, "paso": 0, "datos": {}}
+def limpiar_conversacion(chat_id_str):
+    conversacion[chat_id_str] = {"flujo": None, "paso": 0, "datos": {}}
 
 def fmt_fecha(iso) -> str:
     if not iso:
@@ -267,19 +274,19 @@ def parsear_duracion(texto: str) -> int | None:
             return valor if 1 <= valor <= 365 else None
     return None
 
-async def flujo_setdate(chat_id: int, texto: str) -> str:
-    conv  = conversacion[chat_id]
+async def flujo_setdate(chat_id_str: str, texto: str) -> str:
+    conv  = conversacion[chat_id_str]
     datos = conv["datos"]
-    meds  = usuarios[chat_id]["meds"]
+    meds  = usuarios[chat_id_str]["meds"]
     paso  = conv["paso"]
 
     if texto.lower() in ("/cancelar", "cancelar", "cancel", "salir"):
-        limpiar_conversacion(chat_id)
+        limpiar_conversacion(chat_id_str)
         return "❌ *Configuración de fechas cancelada.*"
 
     if paso == 1:
         if not meds:
-            limpiar_conversacion(chat_id)
+            limpiar_conversacion(chat_id_str)
             return "📭 No tienes medicamentos registrados.\n\nAgrega uno primero con `/addmed nombre`."
         nombre = texto.strip()
         if nombre not in meds:
@@ -322,19 +329,19 @@ async def flujo_setdate(chat_id: int, texto: str) -> str:
     elif paso == 4:
         if texto.lower() in ("sí", "si", "s", "yes", "confirmar", "ok", "vale", "correcto"):
             med_nombre = datos["med"]
-            usuarios[chat_id]["meds"][med_nombre]["fecha_inicio"] = datos["fecha_inicio"]
-            usuarios[chat_id]["meds"][med_nombre]["fecha_fin"]    = datos["fecha_fin"]
-            guardar_datos(usuarios)  # 🔹 Guardar fechas configuradas
-            limpiar_conversacion(chat_id)
+            usuarios[chat_id_str]["meds"][med_nombre]["fecha_inicio"] = datos["fecha_inicio"]
+            usuarios[chat_id_str]["meds"][med_nombre]["fecha_fin"]    = datos["fecha_fin"]
+            await guardar_datos(usuarios) 
+            limpiar_conversacion(chat_id_str)
             return (f"✅ *¡Tratamiento configurado!*\n\n"
                     f"💊 {med_nombre}\n📅 {fmt_fecha(datos['fecha_inicio'])} → {fmt_fecha(datos['fecha_fin'])}")
         elif texto.lower() in ("no", "n", "cancelar", "cancel"):
-            limpiar_conversacion(chat_id)
+            limpiar_conversacion(chat_id_str)
             return "❌ *Configuración cancelada.*"
         else:
             return "Por favor responde *sí* o *no*."
 
-    limpiar_conversacion(chat_id)
+    limpiar_conversacion(chat_id_str)
     return "Ocurrió un error. Intenta de nuevo con `/setdate`."
 
 # ══════════════════════════════════════════════════════════
@@ -346,9 +353,11 @@ async def webhook(req: Request):
     if "message" not in data:
         return {"ok": True}
 
-    chat_id = data["message"]["chat"]["id"]
+    chat_id_raw = data["message"]["chat"]["id"]
     text    = data["message"].get("text", "").strip()
-    init_user(chat_id)
+    
+    # Inicializar o recuperar usuario y guardar en variable de tipo string
+    chat_id = await init_user(chat_id_raw)
 
     meds    = usuarios[chat_id]["meds"]
     profile = usuarios[chat_id]["profile"]
@@ -358,11 +367,11 @@ async def webhook(req: Request):
 
     if conv["flujo"] == "setdate" and not cmd.startswith("/"):
         response = await flujo_setdate(chat_id, text)
-        await bot.send_message(chat_id=chat_id, text=response, parse_mode="Markdown")
+        await bot.send_message(chat_id=chat_id_raw, text=response, parse_mode="Markdown")
         return {"ok": True}
     if conv["flujo"] == "setdate" and cmd not in ("/cancelar", "/setdate"):
         response = await flujo_setdate(chat_id, text)
-        await bot.send_message(chat_id=chat_id, text=response, parse_mode="Markdown")
+        await bot.send_message(chat_id=chat_id_raw, text=response, parse_mode="Markdown")
         return {"ok": True}
 
     response = "❓ Comando no reconocido. Usa /help para ver los comandos."
@@ -396,11 +405,11 @@ async def webhook(req: Request):
             try: edad = int(partes[2])
             except ValueError:
                 response = "❌ La edad debe ser un número."
-                await bot.send_message(chat_id=chat_id, text=response, parse_mode="Markdown")
+                await bot.send_message(chat_id=chat_id_raw, text=response, parse_mode="Markdown")
                 return {"ok": True}
             notas = " ".join(partes[3:]) if len(partes) > 3 else "—"
             profile.update({"nombre": nombre, "edad": edad, "notas": notas})
-            guardar_datos(usuarios)  # 🔹 Guardar perfil
+            await guardar_datos(usuarios) 
             response = f"✅ *Perfil guardado*\n👤 {nombre} ({edad} años)"
 
     elif cmd == "/addmed":
@@ -412,7 +421,7 @@ async def webhook(req: Request):
                 response = f"⚠️ *{nombre}* ya existe."
             else:
                 meds[nombre] = {"horarios": [], "fecha_inicio": None, "fecha_fin": None, "pausado": False}
-                guardar_datos(usuarios)  # 🔹 Guardar nuevo medicamento
+                await guardar_datos(usuarios) 
                 response = f"✅ Agregado: *{nombre}*\nConfigura horarios: `/settime {nombre} 08:00`"
 
     elif cmd == "/listmed":
@@ -433,7 +442,7 @@ async def webhook(req: Request):
                 response = f"❌ No existe *{nombre}*."
             else:
                 del meds[nombre]
-                guardar_datos(usuarios)  # 🔹 Guardar eliminación
+                await guardar_datos(usuarios) 
                 registrar_todos_los_horarios()
                 response = f"🗑️ *{nombre}* eliminado."
 
@@ -450,7 +459,7 @@ async def webhook(req: Request):
                     response = f"❌ Horas inválidas: `{'`, `'.join(invalidas)}`"
                 else:
                     meds[nombre]["horarios"] = sorted(list(set(horas)))
-                    guardar_datos(usuarios)  # 🔹 Guardar horarios
+                    await guardar_datos(usuarios) 
                     registrar_todos_los_horarios()
                     response = f"✅ Horarios para *{nombre}*:\n" + "\n".join(f"  • `{h}`" for h in meds[nombre]["horarios"])
 
@@ -487,7 +496,7 @@ async def webhook(req: Request):
             elif meds[nombre]["pausado"]: response = f"⚠️ *{nombre}* ya está pausado."
             else:
                 meds[nombre]["pausado"] = True
-                guardar_datos(usuarios)  # 🔹 Guardar estado
+                await guardar_datos(usuarios) 
                 registrar_todos_los_horarios()
                 response = f"⏸ *{nombre}* pausado."
 
@@ -499,7 +508,7 @@ async def webhook(req: Request):
             elif not meds[nombre]["pausado"]: response = f"⚠️ *{nombre}* ya está activo."
             else:
                 meds[nombre]["pausado"] = False
-                guardar_datos(usuarios)  # 🔹 Guardar estado
+                await guardar_datos(usuarios) 
                 registrar_todos_los_horarios()
                 response = f"▶️ *{nombre}* reactivado."
 
@@ -514,7 +523,7 @@ async def webhook(req: Request):
     elif cmd == "/test":
         senales_pendientes.append({
             "medicamento": "PRUEBA", "horario": datetime.now().strftime("%H:%M"),
-            "timestamp": datetime.now().isoformat(), "chat_id": chat_id
+            "timestamp": datetime.now().isoformat(), "chat_id": chat_id_raw
         })
         response = "🧪 *Señal de prueba enviada.*\nEl ESP32 la recibirá en su próxima consulta."
 
@@ -523,5 +532,5 @@ async def webhook(req: Request):
         elif cmd.startswith("/"): response = f"❓ Comando `{cmd}` no reconocido."
         else: response = "💬 Usa /help para ver comandos."
 
-    await bot.send_message(chat_id=chat_id, text=response, parse_mode="Markdown")
+    await bot.send_message(chat_id=chat_id_raw, text=response, parse_mode="Markdown")
     return {"ok": True}
