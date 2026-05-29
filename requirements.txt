@@ -3,3 +3,4 @@ uvicorn[standard]
 python-telegram-bot==20.8
 APScheduler==3.10.4
 httpx
+motor
